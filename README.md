@@ -4,6 +4,12 @@
 
 This guide provides everything you need to implement Glyph NFTs on the Radiant blockchain. It includes critical discoveries from real-world implementation that are not documented elsewhere.
 
+> **FOR AI AGENTS — Start Here:**
+> - **First NFT mint?** → Read sections 2 (Critical Requirements), 4 (On-Chain Images), 6 (CBOR Payload), then 7-9 (Commit/Reveal/Signing)
+> - **Debugging a failed mint?** → Jump to section 12 (Common Errors) and the Appendix (opcodes, hex values)
+> - **Upgrading to V2?** → Read section 15 (What's New in V2) and the Fee Calculations section for updated costs
+> - **Using Claude with MCP?** → See [BUILDING_WITH_CLAUDE.md](BUILDING_WITH_CLAUDE.md) for MCP setup and workflow tips
+
 ---
 
 ## Table of Contents
@@ -22,7 +28,8 @@ This guide provides everything you need to implement Glyph NFTs on the Radiant b
 12. [Common Errors & Solutions](#common-errors--solutions)
 13. [Complete Implementation Example](#complete-implementation-example)
 14. [Testing & Verification](#testing--verification)
-15. [Appendix: Quick Reference](#appendix-quick-reference)
+15. [What's New in V2](#whats-new-in-v2)
+16. [Appendix: Quick Reference](#appendix-quick-reference)
 
 ---
 
@@ -115,7 +122,7 @@ if (typeof CBOR === 'undefined') {
 
 ```javascript
 payload.main = {
-    t: 'image/jpeg',    // MIME type
+    t: 'image/webp',    // MIME type (must match thumbnail format)
     b: thumbnailBytes   // Uint8Array of image data
 };
 ```
@@ -135,7 +142,7 @@ WRONG:   d824<ref>7576a914...  // The 24 breaks it
 
 ### Software Requirements
 
-1. **Radiant Node** - Running with RPC access
+1. **Radiant Node** (v2.1.0+) - Running with RPC access. V2 activates at block 410,000.
    ```bash
    # Docker example
    docker run -d --name radiant-node \
@@ -208,7 +215,7 @@ IPFS links in the `loc` field are for **full-resolution backup**, not wallet dis
     p: [2],
     name: "My NFT",
     main: {
-        t: 'image/jpeg',           // MIME type
+        t: 'image/webp',           // MIME type (must match thumbnail format)
         b: thumbnailUint8Array     // Image data as Uint8Array
     },
     loc: 'ipfs://Qm...'            // Full-res backup (optional)
@@ -217,18 +224,18 @@ IPFS links in the `loc` field are for **full-resolution backup**, not wallet dis
 
 ### Thumbnail Size vs Cost Tradeoffs
 
-| Format | Dimensions | Quality | Approx. Bytes | Approx. Cost |
-|--------|------------|---------|---------------|--------------|
-| JPEG   | 150px      | 65%     | 8-10 KB       | ~0.10 RXD    |
-| JPEG   | 200px      | 75%     | 14-18 KB      | ~0.15 RXD    |
-| WebP   | 200px      | 85%     | 15-17 KB      | ~0.17 RXD    |
-| **WebP** | **225px** | **90%** | **20-25 KB** | **~0.22 RXD** |
-| PNG    | 200px      | lossless| 70-85 KB      | ~0.85 RXD    |
+| Format | Dimensions | Quality | Approx. Bytes | Pre-V2 Cost | Post-V2 Cost (10x) |
+|--------|------------|---------|---------------|-------------|---------------------|
+| JPEG   | 150px      | 65%     | 5-8 KB        | ~0.07 RXD   | ~0.7 RXD            |
+| JPEG   | 200px      | 75%     | 14-18 KB      | ~0.15 RXD   | ~1.5 RXD            |
+| WebP   | 200px      | 85%     | 15-17 KB      | ~0.17 RXD   | ~1.7 RXD            |
+| **WebP** | **225px** | **90%** | **20-25 KB** | **~0.22 RXD** | **~2.2 RXD**      |
+| PNG    | 200px      | lossless| 70-85 KB      | ~0.85 RXD   | ~8.5 RXD            |
 
 **Recommendation:** Use **WebP format** at 225px max dimension with 90% quality. This provides:
 - Sharp, clear images with excellent detail retention
 - Best quality-to-size ratio of any format
-- Good balance between quality and transaction costs (~0.22 RXD)
+- Good balance between quality and transaction costs
 - Full compatibility with Glyphium wallet and Glyph Explorer
 
 **Why WebP over JPEG?**
@@ -371,7 +378,7 @@ Ref:         263c6922e5b0bfb29b78e25331823ba0b59924d4da5348b414225b082d40fb6a000
     name: "My NFT #12345",            // Token name (REQUIRED)
     type: "photo",                    // Type (optional)
     main: {                           // On-chain image (REQUIRED for display!)
-        t: 'image/jpeg',              // MIME type
+        t: 'image/webp',              // MIME type (must match thumbnail format)
         b: thumbnailUint8Array        // Image bytes
     },
     in: [containerRefBytes],          // Container ref (optional)
@@ -389,11 +396,17 @@ Ref:         263c6922e5b0bfb29b78e25331823ba0b59924d4da5348b414225b082d40fb6a000
 
 | Value | Meaning |
 |-------|---------|
-| 1 | Fungible Token |
+| 1 | Fungible Token (FT) |
 | 2 | Non-Fungible Token (NFT) |
-| 3 | Data Storage |
-| 4 | Decentralized Mint |
-| 5 | Mutable |
+| 3 | Data Storage (DAT) |
+| 4 | Decentralized Mint (dMint) |
+| 5 | Mutable (MUT) |
+| 6 | Explicit Burn |
+| 7 | Container / Collection (parent-only) |
+| 8 | Encrypted Content |
+| 9 | Timelocked Reveal |
+| 10 | Issuer Authority |
+| 11 | WAVE Naming System |
 
 ### Container and Author Refs
 
@@ -496,7 +509,7 @@ const payload = {
 
 Container refs organize NFTs into collections:
 - All NFTs with the same `in` ref appear under that container in explorers
-- This creates browsable collections (e.g., "FlipperHub Verified Photos")
+- This creates browsable collections (e.g., "My App Verified Photos")
 - Essential for platform branding and user experience
 
 **Testing container refs:**
@@ -707,6 +720,13 @@ Use radiantjs library to sign the reveal transaction.
 
 ### Node.js Signing Script
 
+> **Private Key Security:**
+> - **Never** pass WIF keys as command-line arguments (visible in `ps`, shell history)
+> - **Never** hardcode WIF keys in source code or commit to git
+> - Load keys from files or environment at runtime: `fs.readFileSync('/path/to/key.wif', 'utf8').trim()`
+> - For development, use a wallet with limited funds only
+> - For production, use dedicated signing services or hardware wallets
+
 ```javascript
 #!/usr/bin/env node
 const { Script, Transaction, PrivateKey, crypto } = require('@radiantblockchain/radiantjs');
@@ -738,13 +758,13 @@ async function signReveal(params) {
         script: new Script(),
         output: new Transaction.Output({
             script: Script.fromHex(commitScript),
-            satoshis: commitAmount,
+            satoshis: commitAmount, // radiantjs uses 'satoshis' — these are photons on Radiant
         }),
     }));
 
     tx.addOutput(new Transaction.Output({
         script: Script.fromHex(singletonScript),
-        satoshis: outputSats
+        satoshis: outputSats // photons
     }));
 
     // Build glyph scriptSig
@@ -791,19 +811,49 @@ async function signReveal(params) {
 
 ## Fee Calculations & Cost Analysis
 
+> **V2 Fee Change (Block 415,000+):** Minimum relay fee increases 10x (1,000 to
+> 10,000 photons/byte) after a 5,000-block grace period. Use `estimatefee` RPC
+> instead of hardcoding fee rates.
+>
+> **Note:** `estimatefee` returns a dynamic network estimate that may be lower
+> than the policy minimum. Always enforce the minimum relay fee as a floor:
+> `max(estimatefee_result, minimum_relay_fee)`.
+
 ### Radiant Fee Structure
 
-**Radiant uses sat/byte** (NOT sat/kB like Bitcoin):
-- Minimum relay fee: **1000 sat/byte**
+**Radiant uses photons/byte** (NOT photons/kB like Bitcoin):
+- Minimum relay fee: **1000 photons/byte** (0.01 RXD/kB)
+- Post-block 415,000: **10,000 photons/byte** (0.1 RXD/kB)
 - Always add 50% safety margin
+
+> **Terminology:** Photons are Radiant's smallest unit (like satoshis in Bitcoin).
+> Code samples use `$feeSats` / `satoshis` variable names because radiantjs and
+> most Radiant tooling inherited Bitcoin-style naming. The unit is the same — 1
+> RXD = 100,000,000 photons.
+
+### Fee Calculation Pattern
+
+```php
+function calculateFee($rpc, $txSize) {
+    $blockHeight = $rpc->call('getblockcount');
+    $minRate = ($blockHeight >= 415000) ? 10000 : 1000; // photons/byte
+
+    // Use estimatefee as a signal, but never go below the minimum
+    $estimate = $rpc->call('estimatefee', [6]); // RXD/kB
+    $estimateRate = ($estimate > 0) ? $estimate * 100000000 / 1000 : $minRate; // → photons/byte
+
+    $feeRate = max($minRate, $estimateRate);
+    return $txSize * $feeRate * 1.5; // 50% safety margin, in photons
+}
+```
 
 ### Common Fee Bug
 
 ```php
-// WRONG - treats feeRate as sat/kB
+// WRONG - treats feeRate as photons/kB
 $feeSats = ($txSize * $feeRate) / 1000;
 
-// CORRECT - feeRate is already sat/byte
+// CORRECT - feeRate is already photons/byte
 $feeSats = $txSize * $feeRate;
 ```
 
@@ -811,32 +861,34 @@ $feeSats = $txSize * $feeRate;
 
 Based on verified mainnet transactions (January 2026):
 
-| Component | Size | Cost (@1000 sat/byte) |
-|-----------|------|----------------------|
-| Commit TX (base) | ~300 bytes | ~0.003 RXD |
-| Reveal TX (base) | ~250 bytes | ~0.0025 RXD |
-| Thumbnail (150px, 65%) | ~6,000 bytes | ~0.06 RXD |
-| Thumbnail (200px, 70%) | ~15,000 bytes | ~0.15 RXD |
-| CBOR metadata | ~200-500 bytes | ~0.002-0.005 RXD |
+| Component | Size | Pre-V2 Cost | Post-V2 Cost (10x) |
+|-----------|------|-------------|---------------------|
+| Commit TX (base) | ~300 bytes | ~0.003 RXD | ~0.03 RXD |
+| Reveal TX (base) | ~250 bytes | ~0.0025 RXD | ~0.025 RXD |
+| Thumbnail (150px, 65%) | ~6,000 bytes | ~0.06 RXD | ~0.6 RXD |
+| Thumbnail (200px, 70%) | ~15,000 bytes | ~0.15 RXD | ~1.5 RXD |
+| CBOR metadata | ~200-500 bytes | ~0.002-0.005 RXD | ~0.02-0.05 RXD |
 
 **Total Cost Formula:**
 ```
-Total = Commit Fee + Reveal Fee + (Thumbnail Size × 0.00001 RXD/byte)
+Total = Commit Fee + Reveal Fee + (Thumbnail Size × fee_per_byte)
+// Pre-V2:  fee_per_byte = 0.00001 RXD/byte (1000 photons/byte)
+// Post-V2: fee_per_byte = 0.0001 RXD/byte  (10,000 photons/byte)
 ```
 
-**Example with 150px thumbnail:**
-- Commit: 0.003 RXD
-- Reveal base: 0.0025 RXD
-- Thumbnail (6KB): 0.06 RXD
-- Metadata (300 bytes): 0.003 RXD
-- **Total: ~0.07 RXD**
+**Example with 150px thumbnail (pre-V2 / post-V2):**
+- Commit: 0.003 / 0.03 RXD
+- Reveal base: 0.0025 / 0.025 RXD
+- Thumbnail (6KB): 0.06 / 0.6 RXD
+- Metadata (300 bytes): 0.003 / 0.03 RXD
+- **Total: ~0.07 / ~0.69 RXD**
 
-**Example with 200px thumbnail:**
-- Commit: 0.003 RXD
-- Reveal base: 0.0025 RXD
-- Thumbnail (15KB): 0.15 RXD
-- Metadata (300 bytes): 0.003 RXD
-- **Total: ~0.16 RXD**
+**Example with 200px thumbnail (pre-V2 / post-V2):**
+- Commit: 0.003 / 0.03 RXD
+- Reveal base: 0.0025 / 0.025 RXD
+- Thumbnail (15KB): 0.15 / 1.5 RXD
+- Metadata (300 bytes): 0.003 / 0.03 RXD
+- **Total: ~0.16 / ~1.59 RXD**
 
 ---
 
@@ -918,7 +970,7 @@ IPFS_SKIP_SSL_VERIFY=true
 **Fix:** Add thumbnail to payload:
 ```javascript
 payload.main = {
-    t: 'image/jpeg',
+    t: 'image/webp',        // Must match thumbnail format
     b: thumbnailUint8Array  // Must be Uint8Array, not base64
 };
 ```
@@ -961,8 +1013,11 @@ const commitResult = await createCommitTransaction(feeRate, glyphHex);
 
 **Fix:**
 ```php
-// Radiant uses 1000 sat/byte (NOT sat/kB)
-$feeSats = $txSize * 1000 * 1.5;  // With safety margin
+// Radiant uses 1000 photons/byte (NOT photons/kB)
+// Post-block 415,000: 10,000 photons/byte (10x increase)
+// Pre-V2: 1000, Post-block 415,000: 10000
+$minRate = 1000; // Update to 10000 after block 415,000
+$feeSats = $txSize * $minRate * 1.5;  // photons, with safety margin
 ```
 
 ### "reference-operations" error
@@ -1156,16 +1211,16 @@ console.log('CBOR test:', decoded.name === "Test" ? 'PASS' : 'FAIL');
 
 ```javascript
 // Check thumbnail size before minting
-const thumbnail = await createThumbnail(imageDataUrl, 150, 0.65);
+const thumbnail = await createThumbnail(imageDataUrl, 225, 0.90);
 console.log(`Thumbnail size: ${thumbnail.length} bytes`);
-if (thumbnail.length > 10000) {
-    console.warn('Thumbnail large - consider reducing quality');
+if (thumbnail.length > 30000) {
+    console.warn('Thumbnail large - consider reducing quality or dimensions');
 }
 ```
 
 ### Verify on Glyph Explorer
 
-Visit: `https://glyph.photonic.online/tx/<reveal_txid>`
+Visit: `https://glyph-explorer.rxd-radiant.com/tx/<reveal_txid>`
 
 You should see:
 - NFT image displayed (from `main` field)
@@ -1359,6 +1414,27 @@ Before any blockchain operation:
 
 ---
 
+## What's New in V2
+
+> These features have not been extensively tested by the authors of this guide. The information below is documented from specifications, not from implementation experience.
+
+### V2 Activation (Block 410,000)
+
+Six new opcodes: BLAKE3, K12, bitwise shifts, 2MUL, 2DIV. These enable dMint mining validation and advanced contracts. See opcode table in Appendix.
+
+### Fee Increase (Block 415,000)
+
+Minimum relay fee increases 10x from 0.01 RXD/kB to 0.1 RXD/kB after a 5,000-block grace period. See Fee Calculations section for updated cost table.
+
+### New Protocols: dMint and WAVE
+
+- **dMint** — Mineable token distribution via PoW. Protocol combination `[1, 4]`. Three active mining algorithms: SHA256D (0), BLAKE3 (1), K12 (2).
+- **WAVE** — On-chain naming system. Protocol 11. Provides human-readable addresses and DNS-like records.
+
+See the [Radiant AI Knowledge Base](https://github.com/Radiant-Core/radiant-mcp-server/blob/main/docs/RADIANT_AI_KNOWLEDGE_BASE.md) for implementation details.
+
+---
+
 ## Appendix: Quick Reference
 
 ### Opcodes
@@ -1377,6 +1453,17 @@ Before any blockchain operation:
 | `a9` | OP_HASH160 | RIPEMD160(SHA256(x)) |
 | `ac` | OP_CHECKSIG | Verify signature |
 
+#### V2 Opcodes (available after block 410,000)
+
+| Hex | Name | Notes |
+|-----|------|-------|
+| `ee` | OP_BLAKE3 | BLAKE3 hash (max 1024-byte input) |
+| `ef` | OP_K12 | KangarooTwelve hash |
+| `98` | OP_LSHIFT | Bitwise left shift |
+| `99` | OP_RSHIFT | Bitwise right shift |
+| `8d` | OP_2MUL | Multiply by 2 |
+| `8e` | OP_2DIV | Divide by 2 |
+
 ### Key Hex Values
 
 | Purpose | Hex |
@@ -1390,7 +1477,7 @@ Before any blockchain operation:
 ### Checklist Before Minting
 
 - [ ] CBOR library loaded (`typeof CBOR === 'object'`)
-- [ ] Thumbnail created (Uint8Array, < 15KB recommended)
+- [ ] Thumbnail created (Uint8Array, < 30KB recommended)
 - [ ] `main` field added to payload with `t` and `b` properties
 - [ ] Protocol set (`p: [2]`)
 - [ ] Name set
@@ -1398,17 +1485,11 @@ Before any blockchain operation:
 
 ### Cost Quick Reference
 
-| Thumbnail | Format | Approx. Size | Approx. Total Cost |
-|-----------|--------|--------------|-------------------|
-| 100px, 50% | JPEG | 2-4 KB | ~0.04 RXD |
-| 150px, 65% | JPEG | 5-8 KB | ~0.07 RXD |
-| 200px, 85% | WebP | 15-17 KB | ~0.17 RXD |
-| **225px, 90%** | **WebP** | **20-25 KB** | **~0.22 RXD** |
-| 300px, 80% | JPEG | 20-30 KB | ~0.30 RXD |
+See [Thumbnail Size vs Cost Tradeoffs](#thumbnail-size-vs-cost-tradeoffs) and [Fee Calculations & Cost Analysis](#fee-calculations--cost-analysis) for detailed cost tables with pre-V2 and post-V2 pricing.
 
 ---
 
-**Last Updated:** 2026-01-12
+**Last Updated:** 2026-02-27
 **Based on Verified Mainnet Transactions:**
 - With thumbnail: `27390efab1e3168c05301b18f6cdfd553a6d122a41496d0f5e104e79a918be7e`
 

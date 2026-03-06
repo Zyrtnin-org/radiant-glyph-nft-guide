@@ -613,7 +613,7 @@
                     <div style="margin-bottom: 20px;">
                         <strong>Thumbnail Size:</strong> ${thumbnail.length} bytes (${(thumbnail.length / 1024).toFixed(2)} KB)<br>
                         <strong>Total Glyph Data:</strong> ${glyphData.length} bytes (${(glyphData.length / 1024).toFixed(2)} KB)<br>
-                        <strong>Estimated Cost:</strong> ~${(glyphData.length * 0.000015).toFixed(4)} RXD
+                        <strong>Estimated Cost:</strong> ~${(glyphData.length * 0.00001).toFixed(4)} RXD
                     </div>
                 `;
                 document.getElementById('verificationData').innerHTML = verificationHtml;
@@ -628,7 +628,7 @@
                     - On-chain thumbnail (${thumbnail.length} bytes WebP)<br><br>
                     <strong>To complete minting, you would need:</strong><br>
                     1. Radiant node RPC access to create/sign/broadcast transactions<br>
-                    2. Wallet with sufficient RXD balance (~${(glyphData.length * 0.000015 + 0.01).toFixed(4)} RXD)<br>
+                    2. Wallet with sufficient RXD balance (~${(glyphData.length * 0.00001 + 0.01).toFixed(4)} RXD)<br>
                     3. Node.js signing script with radiantjs library<br><br>
                     <strong>Next steps:</strong> See "Complete Implementation Example" section in the guide.
                 `);

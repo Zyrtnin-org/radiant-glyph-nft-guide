@@ -11,6 +11,8 @@ This document shares lessons learned from building a production NFT application 
 1. [Introduction](#introduction)
 2. [Critical Discoveries](#critical-discoveries)
 3. [Why Claude for Blockchain Development](#why-claude-for-blockchain-development)
+   - [With the MCP Server](#with-the-mcp-server)
+   - [Setting Up the MCP Server](#setting-up-the-mcp-server)
 4. [Project Setup](#project-setup)
 5. [Working with Claude](#working-with-claude)
 6. [Glyph NFT Implementation](#glyph-nft-implementation)
@@ -55,13 +57,13 @@ After much debugging, we discovered that Glyph wallets look for the `main` field
 **The Solution:**
 ```javascript
 payload.main = {
-    t: 'image/jpeg',           // MIME type
+    t: 'image/webp',           // MIME type (must match thumbnail format)
     b: thumbnailUint8Array     // Image data as Uint8Array (NOT base64!)
 };
 ```
 
 **Cost Impact:**
-- 150px, 65% quality thumbnail: ~6KB, ~0.06 RXD extra cost
+- 225px, 90% WebP thumbnail: ~22KB, ~0.22 RXD extra cost (pre-V2)
 - Worth it for visible NFTs!
 
 ### Discovery 2: CBOR Encoding is Mandatory
@@ -95,13 +97,16 @@ Claude suggested checking the browser console. We saw "CBOR library not loaded, 
 - Result: Blurry, pixelated thumbnails
 - Size: ~3KB
 
-**Final Settings:** 150px, 65% quality
+**Initial Working Settings:** 150px, 65% JPEG
 - Result: Clear, recognizable images
-- Size: ~6KB
-- Cost: ~0.06 RXD extra
+- Size: ~6KB, Cost: ~0.06 RXD extra
+
+**Updated Recommendation:** 225px, 90% WebP
+- Result: Sharp, detailed images with best quality-to-size ratio
+- Size: ~22KB, Cost: ~0.22 RXD extra (pre-V2)
 
 **The Lesson:**
-Don't over-optimize thumbnail size. A few KB difference costs pennies but makes NFTs look professional.
+Don't over-optimize thumbnail size. WebP gives better quality at comparable sizes to JPEG.
 
 ### Discovery 4: Container/Author Refs Must Be Extracted, Not Calculated
 
@@ -201,21 +206,49 @@ Claude automatically generated:
 - Test transaction references
 - **Updated docs as new discoveries were made**
 
-### Limitations
+### With the MCP Server
 
-**Doesn't Have Radiant Mainnet Access:**
-Claude can't:
-- Test transactions directly
-- Verify on-chain data
-- Check current blockchain state
-- Access mempool status
+**Claude can now query the Radiant blockchain directly** via the [Radiant MCP Server](https://github.com/Radiant-Core/radiant-mcp-server) (56 tools across read-only queries, token operations, wallet management, and transaction building):
+- Check balances, UTXOs, and transaction history
+- Read Glyph token metadata and verify NFT state
+- Build, sign, and broadcast transactions
+- Mint NFTs and FTs directly (commit/reveal flow)
+- Transfer and burn tokens
+- Decode scripts and parse Glyph envelopes
+- Query dMint contracts, WAVE names, and DEX orderbooks
+- Estimate fees from the network
 
-**You Still Need:**
-- Actual Radiant node for testing
-- Manual verification of transactions
-- Hex editor for script inspection
-- Block explorer for confirmation
-- **Screenshots of wallet display** (for visual issues)
+### Still Always Needed
+
+- **Visual verification in Glyphium/Photonic wallet** — screenshots catch display issues code can't
+- **Testing NFT display in wallets** — blank cards, metadata rendering problems
+- **Mempool inspection** — not available via MCP
+- **Private key security review** — MCP accepts WIF keys for signing; understand the trust implications
+
+### Setting Up the MCP Server
+
+Install and register the [Radiant MCP Server](https://github.com/Radiant-Core/radiant-mcp-server) to give Claude direct blockchain access:
+
+```bash
+git clone https://github.com/Radiant-Core/radiant-mcp-server.git
+cd radiant-mcp-server
+npm install
+npm run build
+
+claude mcp add \
+  -e ELECTRUMX_HOST=electrumx.radiant4people.com \
+  -e ELECTRUMX_PORT=50012 \
+  -e ELECTRUMX_SSL=true \
+  -e RADIANT_NETWORK=mainnet \
+  --transport stdio \
+  --scope user \
+  radiant \
+  -- node /path/to/radiant-mcp-server/dist/index.js
+```
+
+> **Gotcha:** `-e` environment flags must come BEFORE `--transport` and `--scope`, or you get "Invalid environment variable format" error.
+
+Restart your Claude Code session after adding. Verify with `claude mcp list`.
 
 ---
 
@@ -287,8 +320,9 @@ Before writing any code, ensure:
 ```
 ❌ BAD: "How do I calculate transaction fees?"
 
-✅ GOOD: "Radiant uses sat/byte for fees (NOT sat/kB like Bitcoin).
-The minimum is 1000 sat/byte. Here's my current code that's wrong:
+✅ GOOD: "Radiant uses photons/byte for fees (NOT photons/kB like Bitcoin).
+The minimum is 1000 photons/byte (increasing to 10,000 after block 415,000).
+Here's my current code that's wrong:
 $fee = ($txSize * $feeRate) / 1000;
 How should I fix this?"
 ```
@@ -369,7 +403,7 @@ const payload = {
     name: "Score: 1,234,567",         // Display name (REQUIRED)
     type: "photo",                    // Type (optional)
     main: {                           // On-chain image (REQUIRED for display!)
-        t: 'image/jpeg',
+        t: 'image/webp',             // Must match thumbnail format
         b: thumbnailUint8Array        // NOT base64!
     },
     loc: 'ipfs://Qm...',              // Full-res backup (optional)
@@ -388,7 +422,7 @@ const payload = {
 **Optimized settings based on testing:**
 
 ```javascript
-async createThumbnail(dataUrl, maxSize = 150, quality = 0.65) {
+async createThumbnail(dataUrl, maxSize = 225, quality = 0.90) {
     return new Promise((resolve, reject) => {
         const img = new Image();
         img.onload = () => {
@@ -425,7 +459,7 @@ async createThumbnail(dataUrl, maxSize = 150, quality = 0.65) {
                 };
                 reader.onerror = reject;
                 reader.readAsArrayBuffer(blob);
-            }, 'image/jpeg', quality);
+            }, 'image/webp', quality);
         };
         img.onerror = reject;
         img.src = dataUrl;
@@ -475,7 +509,7 @@ function encodeGlyphData(data) {
 **Fix:**
 ```javascript
 payload.main = {
-    t: 'image/jpeg',
+    t: 'image/webp',        // Must match thumbnail format
     b: thumbnailUint8Array  // Must be Uint8Array!
 };
 ```
@@ -501,7 +535,8 @@ $fee = ($txSize * $feeRate) / 1000;
 
 **The Fix:**
 ```php
-// CORRECT - Radiant uses sat/byte
+// CORRECT - Radiant uses photons/byte (photons are Radiant's smallest unit)
+// Pre-V2: 1000 photons/byte. Post-block 415,000: 10,000 photons/byte (10x).
 $fee = $txSize * $feeRate;
 ```
 
@@ -553,8 +588,8 @@ const thumbnail = await createThumbnail(dataUrl, 100, 0.5);
 **The Fix:**
 ```javascript
 // Balanced settings
-const thumbnail = await createThumbnail(dataUrl, 150, 0.65);
-// Result: Clear images, reasonable size (~6KB)
+const thumbnail = await createThumbnail(dataUrl, 225, 0.90);
+// Result: Sharp images, good size (~22KB)
 ```
 
 ### 7. Orphaned Child NFTs (Container Refs)
@@ -613,11 +648,11 @@ console.log('Payload:', JSON.stringify(payload, null, 2));
 console.log('Thumbnail type:', typeof payload.main?.b);
 // Should be "object" (Uint8Array)
 console.log('Thumbnail size:', payload.main?.b?.length);
-// Should be 5000-10000 bytes for 150px
+// Should be 15000-25000 bytes for 225px WebP
 ```
 
 **4. Check Transaction**
-- View on Glyph Explorer: `https://glyph.photonic.online/tx/<txid>`
+- View on Glyph Explorer: `https://glyph-explorer.rxd-radiant.com/tx/<txid>`
 - Verify metadata decodes correctly
 
 ### When Transactions Fail
@@ -655,7 +690,7 @@ Can you compare the structures?"
 Before minting to mainnet:
 
 - [ ] `typeof CBOR === 'object'` in browser console
-- [ ] Thumbnail is Uint8Array, < 15KB
+- [ ] Thumbnail is Uint8Array, < 30KB
 - [ ] Payload has `p`, `name`, and `main` fields
 - [ ] IPFS upload succeeds (if using)
 - [ ] Test CBOR encode/decode round-trip
@@ -688,7 +723,7 @@ After minting:
 ```javascript
 async mintNFT(imageDataUrl, metadata) {
     // 1. Create thumbnail
-    const thumbnail = await this.createThumbnail(imageDataUrl, 150, 0.65);
+    const thumbnail = await this.createThumbnail(imageDataUrl, 225, 0.90);
     console.log(`Thumbnail: ${thumbnail.length} bytes`);
 
     // 2. Upload full-res to IPFS
@@ -699,7 +734,7 @@ async mintNFT(imageDataUrl, metadata) {
     const payload = {
         p: [2],
         name: metadata.name,
-        main: { t: 'image/jpeg', b: thumbnail },
+        main: { t: 'image/webp', b: thumbnail },
         loc: ipfs.url,
         attrs: metadata.attrs
     };
@@ -732,7 +767,7 @@ function encodeGlyphData(data) {
 async createThumbnail(dataUrl, maxSize, quality) {
     const thumbnail = await this._createThumbnail(dataUrl, maxSize, quality);
 
-    if (thumbnail.length > 15000) {
+    if (thumbnail.length > 30000) {
         console.warn(`Thumbnail large (${thumbnail.length} bytes). Consider reducing.`);
     }
 
@@ -756,13 +791,21 @@ async createThumbnail(dataUrl, maxSize, quality) {
 - Glyph protocol: https://radiantblockchain.org/glyphs-protocol-guide.html
 
 **Libraries:**
-- radiantjs: https://github.com/RadiantBlockchain/radiantjs
-- Photonic Wallet: https://github.com/nickmasse/photonic-wallet
+- radiantjs: https://github.com/Radiant-Core/radiantjs
+- Photonic Wallet: https://github.com/Radiant-Core/Photonic-Wallet
 - CBOR: https://github.com/paroga/cbor-js
+
+**AI Development Tools:**
+- Radiant MCP Server: https://github.com/Radiant-Core/radiant-mcp-server
+- AI Knowledge Base: https://github.com/Radiant-Core/radiant-mcp-server/blob/main/docs/RADIANT_AI_KNOWLEDGE_BASE.md
+
+**Ecosystem Tools:**
+- RXinDexer (token indexer): https://github.com/Radiant-Core/RXinDexer
+- Glyph-miner (dMint mining): https://github.com/Radiant-Core/Glyph-miner
 
 **Explorers:**
 - Mainnet: https://explorer.radiantblockchain.org
-- Glyph explorer: https://glyph.photonic.online
+- Glyph explorer: https://glyph-explorer.rxd-radiant.com
 
 ### Example Prompts for Common Tasks
 
@@ -772,7 +815,7 @@ async createThumbnail(dataUrl, maxSize, quality) {
 
 I discovered I need a 'main' field with on-chain image data.
 Can you:
-1. Create a thumbnail function (150px, 65% quality)
+1. Create a thumbnail function (225px WebP, 90% quality)
 2. Add main field to payload with {t: mimetype, b: Uint8Array}
 3. Keep IPFS link in loc field for full-res"
 ```
@@ -809,7 +852,7 @@ What settings give good visual quality at lower cost?"
 2. **Iterative Improvement**
    - Started with 200px thumbnails (~15KB)
    - Tested 100px (too blurry)
-   - Settled on 150px (good balance)
+   - Settled on 225px WebP (best quality-to-size ratio)
 
 3. **Comprehensive Logging**
    - Log thumbnail size after creation
@@ -842,7 +885,7 @@ Claude AI is a powerful partner for Radiant blockchain development. The key disc
 
 1. **On-chain images are required** - Use the `main` field
 2. **CBOR encoding is mandatory** - JSON = "Unknown NFT"
-3. **150px, 65% quality** is the optimal thumbnail setting
+3. **225px WebP, 90% quality** is the optimal thumbnail setting
 4. **Verify visually** - Screenshots catch issues code can't
 
 **Keys to Success:**
@@ -852,10 +895,12 @@ Claude AI is a powerful partner for Radiant blockchain development. The key disc
 4. Test in Glyphium wallet, not just explorer
 5. Document working transactions for reference
 
-**Cost Reference:**
-- Minimal NFT (no image): ~0.01 RXD
-- With 150px thumbnail: ~0.07 RXD
-- With 200px thumbnail: ~0.16 RXD
+**Cost Reference (pre-V2 / post-V2):**
+- Minimal NFT (no image): ~0.01 / ~0.1 RXD
+- With 225px WebP thumbnail: ~0.22 / ~2.2 RXD
+- With 150px JPEG (budget): ~0.07 / ~0.69 RXD
+
+> Post-block 415,000: minimum relay fee increases 10x. Use `estimatefee` RPC instead of hardcoding.
 
 Happy building on Radiant!
 
@@ -875,12 +920,12 @@ Post in #development with:
 
 ---
 
-**Last Updated:** 2026-01-10
+**Last Updated:** 2026-02-27
 **Author:** Radiant Developer Community
 **License:** MIT - Free to use and share
 
 **Key Discoveries Documented:**
 1. On-chain images (`main` field) required for wallet display
 2. CBOR encoding mandatory (JSON = "Unknown NFT")
-3. Optimal thumbnail: 150px, 65% quality (~6KB, ~0.07 RXD)
+3. Optimal thumbnail: 225px WebP, 90% quality (~22KB, ~0.22 RXD pre-V2)
 4. SSL certificate issues with IPFS in development
