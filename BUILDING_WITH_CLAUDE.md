@@ -797,7 +797,7 @@ async createThumbnail(dataUrl, maxSize, quality) {
 
 **AI Development Tools:**
 - Radiant MCP Server: https://github.com/Radiant-Core/radiant-mcp-server
-- AI Knowledge Base: https://github.com/Radiant-Core/radiant-mcp-server/blob/main/docs/RADIANT_AI_KNOWLEDGE_BASE.md
+- AI Knowledge Base: https://github.com/Radiant-Core/radiant-mcp-server/blob/master/docs/RADIANT_AI_KNOWLEDGE_BASE.md
 
 **Ecosystem Tools:**
 - RXinDexer (token indexer): https://github.com/Radiant-Core/RXinDexer

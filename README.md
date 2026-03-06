@@ -1433,7 +1433,7 @@ Minimum relay fee increases 10x from 0.01 RXD/kB to 0.1 RXD/kB after a 5,000-blo
 - **dMint** — Mineable token distribution via PoW. Protocol combination `[1, 4]`. Three active mining algorithms: SHA256D (0), BLAKE3 (1), K12 (2).
 - **WAVE** — On-chain naming system. Protocol 11. Provides human-readable addresses and DNS-like records.
 
-See the [Radiant AI Knowledge Base](https://github.com/Radiant-Core/radiant-mcp-server/blob/main/docs/RADIANT_AI_KNOWLEDGE_BASE.md) for implementation details.
+See the [Radiant AI Knowledge Base](https://github.com/Radiant-Core/radiant-mcp-server/blob/master/docs/RADIANT_AI_KNOWLEDGE_BASE.md) for implementation details.
 
 ---
 
