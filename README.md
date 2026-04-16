@@ -7,9 +7,10 @@ This guide provides everything you need to implement Glyph NFTs on the Radiant b
 Designed to be used as context for AI coding agents (Claude, Cursor, etc.) — paste the README into your session and start building. See [BUILDING_WITH_CLAUDE.md](BUILDING_WITH_CLAUDE.md) for MCP server setup and AI-assisted workflow tips.
 
 > **FOR AI AGENTS — Start Here:**
-> - **First NFT mint?** → Read sections 2 (Critical Requirements), 4 (On-Chain Images), 6 (CBOR Payload), then 7-9 (Commit/Reveal/Signing)
-> - **Debugging a failed mint?** → Jump to section 12 (Common Errors) and the Appendix (opcodes, hex values)
-> - **Upgrading to V2?** → Read section 15 (What's New in V2) and the Fee Calculations section for updated costs
+> - **First NFT mint?** → Read sections 2 (Critical Requirements), 5 (On-Chain Images), 8 (CBOR Payload), then 9-11 (Commit/Reveal/Signing)
+> - **First FT integration?** → Read section 7 (Fungible Tokens) for the 75-byte template + wallet classifier patterns
+> - **Debugging a failed mint?** → Jump to section 14 (Common Errors) and the Appendix (opcodes, hex values)
+> - **Upgrading to V2?** → Read section 18 (What's New in V2) and the Fee Calculations section for updated costs
 > - **Hardware wallet (Ledger) support?** → See [`radiant-ledger-guide`](https://github.com/Zyrtnin-org/radiant-ledger-guide). Minting still requires software signing; receiving + spending Glyph UTXOs works with the community Ledger app
 > - **Using Claude with MCP?** → See [BUILDING_WITH_CLAUDE.md](BUILDING_WITH_CLAUDE.md) for MCP setup and workflow tips
 
@@ -1411,7 +1412,7 @@ async function signReveal(params) {
 
 ### Hardware Wallet Support
 
-Glyph **minting** cannot currently be done from a hardware wallet: the reveal transaction's scriptSig (`<glyph_push> <signature> <pubkey>`) is non-standard, and no mainstream hardware wallet supports signing arbitrary script structures. Minting requires software signing via Node.js as shown above.
+Glyph **minting** cannot currently be done from a hardware wallet: the reveal transaction's scriptSig (`<sig> <pubkey> <"gly"> <CBOR>`) is non-standard, and no mainstream hardware wallet supports signing arbitrary script structures. Minting requires software signing via Node.js as shown above.
 
 Glyph **receiving and spending**, however, does work with the community-built Radiant Ledger Nano S Plus app. You can:
 
@@ -1496,7 +1497,7 @@ payload through the commit/reveal path documented in this guide:
 | Commit TX (observed) | ~276 bytes | ~0.003 RXD | ~0.028 RXD |
 | Reveal TX (observed, ~640-byte glyph payload) | ~1,038 bytes | ~0.010 RXD | ~0.104 RXD |
 | Thumbnail (150px, 65%) | ~6,000 bytes | ~0.06 RXD | ~0.6 RXD |
-| Thumbnail (200px, 70%) | ~15,000 bytes | ~0.15 RXD | ~1.5 RXD |
+| Thumbnail (200px, 75%) | ~15,000 bytes | ~0.15 RXD | ~1.5 RXD |
 | CBOR metadata | ~200-500 bytes | ~0.002-0.005 RXD | ~0.02-0.05 RXD |
 
 A typical reveal is ~1 KB even with a small glyph — scriptSig carries signature +
