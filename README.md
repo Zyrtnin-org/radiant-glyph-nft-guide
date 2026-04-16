@@ -20,19 +20,24 @@ Designed to be used as context for AI coding agents (Claude, Cursor, etc.) — p
 1. [Overview](#overview)
 2. [Critical Requirements (Read First!)](#critical-requirements-read-first)
 3. [Prerequisites](#prerequisites)
-4. [On-Chain Images: The `main` Field](#on-chain-images-the-main-field)
-5. [Architecture](#architecture)
-6. [CBOR Payload Format](#cbor-payload-format)
-7. [Commit Transaction](#commit-transaction)
-8. [Reveal Transaction](#reveal-transaction)
-9. [Signing Challenge](#signing-challenge)
-10. [Fee Calculations & Cost Analysis](#fee-calculations--cost-analysis)
-11. [IPFS Integration](#ipfs-integration)
-12. [Common Errors & Solutions](#common-errors--solutions)
-13. [Complete Implementation Example](#complete-implementation-example)
-14. [Testing & Verification](#testing--verification)
-15. [What's New in V2](#whats-new-in-v2)
-16. [Appendix: Quick Reference](#appendix-quick-reference)
+4. [Infrastructure Setup](#infrastructure-setup)
+   - [Getting a Working Radiant Node](#getting-a-working-radiant-node)
+   - [Networking the Node](#networking-the-node)
+   - [Calling the Signer from PHP](#calling-the-signer-from-php)
+5. [On-Chain Images: The `main` Field](#on-chain-images-the-main-field)
+6. [Architecture](#architecture)
+7. [CBOR Payload Format](#cbor-payload-format)
+8. [Commit Transaction](#commit-transaction)
+9. [Reveal Transaction](#reveal-transaction)
+10. [Signing Challenge](#signing-challenge)
+11. [Fee Calculations & Cost Analysis](#fee-calculations--cost-analysis)
+12. [IPFS Integration](#ipfs-integration)
+13. [Common Errors & Solutions](#common-errors--solutions)
+14. [Complete Implementation Example](#complete-implementation-example)
+15. [Testing & Verification](#testing--verification)
+16. [Security Best Practices](#security-best-practices)
+17. [What's New in V2](#whats-new-in-v2)
+18. [Appendix: Quick Reference](#appendix-quick-reference)
 
 ---
 
@@ -202,8 +207,9 @@ WRONG:   d824<ref>7576a914...  // The 24 breaks it
 
    Verify your binary actually has the wallet before proceeding:
    ```bash
-   # If this returns an array (possibly containing ""), you have wallet support.
-   # If it returns error code -32601, you're on a node-only build — upgrade.
+   # Expected: [""] (default wallet loaded) or ["<wallet-name>", ...].
+   # If you get error code -32601 "Method not found", you're on a
+   # node-only build — upgrade.
    radiant-cli -datadir=/home/radiant/.radiant listwallets
    ```
 
@@ -232,20 +238,37 @@ WRONG:   d824<ref>7576a914...  // The 24 breaks it
 3. **radiantjs Library** - For transaction signing.
 
    `@radiantblockchain/radiantjs` is **not published on the npm registry.**
-   Install the `chainbow` fork from GitHub:
+   Install the `chainbow` fork from GitHub — ideally pinned to a commit SHA
+   you've reviewed, since this library sits directly in your signing path:
    ```bash
+   # Pin to a specific commit for reproducibility + supply-chain safety
+   npm install github:chainbow/radiantjs#<commit-sha>
+   # Or, less safely, follow master
    npm install github:chainbow/radiantjs
    ```
+   Commit a `package-lock.json` alongside so the exact resolved tarball is
+   frozen across machines.
 
-   npm installs the package using its `package.json`-declared name, so even though
-   the dependency key is `radiantjs`, the tree lands at
-   `node_modules/@radiantblockchain/radiantjs/`. That's why the signing script
-   uses `require('@radiantblockchain/radiantjs')`, not `require('radiantjs')`.
+   The signing script does `require('@radiantblockchain/radiantjs')` because the
+   package's own `package.json` declares the scoped name. **npm's resolved
+   install path depends on npm version:** recent npm (10+) often places the tree
+   at `node_modules/radiantjs/` (following the dependency key you used), not
+   `node_modules/@radiantblockchain/radiantjs/`. If the scoped require path
+   doesn't resolve after `npm install`, bridge them with a symlink:
+
+   ```bash
+   mkdir -p node_modules/@radiantblockchain
+   ln -sfn ../radiantjs node_modules/@radiantblockchain/radiantjs
+   ```
+
+   The Dockerfile pattern in "Calling the Signer from PHP" below does this
+   automatically — you don't need to do it by hand if you're installing into
+   `/opt/signing-deps/`.
 
    In a `package.json`:
    ```json
    "dependencies": {
-     "radiantjs": "github:chainbow/radiantjs"
+     "radiantjs": "github:chainbow/radiantjs#<commit-sha>"
    }
    ```
 
@@ -313,7 +336,7 @@ v2.2.0 / v2.3.0 landmines. After your container starts, run:
 
 ```bash
 docker exec radiant-node radiant-cli -datadir=/home/radiant/.radiant listwallets
-# Expected: ["") or a list of loaded wallets.
+# Expected: [""] (default wallet loaded) or ["<wallet-name>", ...].
 # If you get error code -32601 "Method not found", your binary is node-only.
 # Rebuild from a v2.3.0 wallet-enabled source.
 ```
@@ -386,10 +409,16 @@ containers on separate Docker networks — that default breaks RPC access silent
 # Bind to all interfaces so containers on the same Docker network can reach us.
 rpcbind=0.0.0.0
 
-# Restrict who's allowed to talk to RPC. The CIDR below covers the standard
-# Docker bridge ranges; tighten to your actual network if you know it.
+# Restrict who's allowed to talk to RPC. Tighten this as much as you can —
+# find your app network's actual CIDR with:
+#   docker network inspect <app-network> --format '{{(index .IPAM.Config 0).Subnet}}'
+# and replace the broad 172.16.0.0/12 fallback below with that CIDR.
 rpcallowip=127.0.0.1
-rpcallowip=172.16.0.0/12
+rpcallowip=172.20.0.0/16           # example: tighten to your app network
+# rpcallowip=172.16.0.0/12         # broad Docker-default fallback — AVOID on
+#                                  # multi-tenant hosts; any other container in
+#                                  # the 172.16-31.x range can reach your RPC
+#                                  # with only the rpcpassword for auth.
 
 # Standard RPC auth — override these in an environment file, not in-repo.
 rpcuser=flipperchain
@@ -526,7 +555,37 @@ function signRevealViaNode(array $params, string $scriptPath): array {
 `/proc/<pid>/cmdline`, env is visible in `/proc/<pid>/environ`. The stdin pipe
 is the only channel that doesn't leave the key in the process table.
 
-**5. RPC creds never touch the browser.** Wrap every blockchain call behind a
+**5. Verify the signed tx before broadcasting.** The stdout-JSON-trust pattern
+above accepts any well-formed `{success:true, signedTx}` and broadcasts it.
+That's convenient but not enough on its own: a compromised signing script (or
+a future supply-chain swap of `chainbow/radiantjs`) could emit a structurally
+valid tx that *pays an attacker address*. The blockchain won't reject a valid
+tx just because it wasn't the one you expected — it only rejects malformed
+ones.
+
+Before `sendrawtransaction`, decode the returned raw tx and assert the outputs
+match what you asked for:
+
+```php
+// After $parsed['signedTx'] comes back:
+$decoded = $rpc->call('decoderawtransaction', [$parsed['signedTx']]);
+
+// Output 0 must be the singleton script with the expected destination pubkeyhash
+$out0 = $decoded['vout'][0];
+if ($out0['value'] * 100_000_000 !== $expectedNftOutputSats) {
+    throw new RuntimeException('signed tx output value mismatch');
+}
+$expectedScript = 'd8' . $ref . '7576a914' . $expectedDestPubkeyhash . '88ac';
+if (strtolower($out0['scriptPubKey']['hex']) !== $expectedScript) {
+    throw new RuntimeException('signed tx output script mismatch — refusing to broadcast');
+}
+// Optional: also check no unexpected outputs (only the singleton + any change)
+```
+
+Without this gate, "trust the stdout JSON" is a soft trust boundary that only
+the cryptographic correctness of the tx (not its semantics) defends.
+
+**6. RPC creds never touch the browser.** Wrap every blockchain call behind a
 PHP endpoint that:
 - Authenticates the caller (session cookie + CSRF token for state-changing calls)
 - Rate-limits by IP and by session
@@ -663,6 +722,26 @@ function createGlyphPayload(photoData, metadata) {
     return payload;
 }
 ```
+
+> ⚠️  **`paroga/cbor-js` Uint8Array trap.** The `b` field above works only if
+> `photoData.thumbnailData` is a real `Uint8Array`. If it's a plain `Array` of
+> numbers (e.g. `Array.from(uint8)`), `paroga/cbor-js` encodes it as a CBOR
+> **array of integers (major type 4)**, not a **byte string (major type 2)**.
+> The bytes land on chain, but Glyph wallets look for major type 2 and render
+> your NFT as a blank card. Two checks save you:
+>
+> 1. **At payload-build time**, assert the type: `if (!(thumbnailData instanceof Uint8Array)) throw new Error('thumbnail must be Uint8Array');`
+> 2. **After encoding**, round-trip the CBOR and confirm `main.b` comes back
+>    as bytes. The `in` and `by` ref fields are a good positive control —
+>    they're 36-byte buffers and render correctly on existing NFTs; if
+>    `main.b` decodes differently than they do, you have the trap.
+>
+> Common ways to end up with a plain Array instead of Uint8Array: JSON
+> round-trips (`JSON.parse(JSON.stringify(payload))` converts `Uint8Array` to
+> a numeric `Array`), shallow copies via `{ ...obj }` into a new plain object,
+> and anything that crosses a `postMessage` / `structuredClone` boundary
+> configured incorrectly. Handle `Uint8Array` as the last step before CBOR
+> encoding.
 
 ---
 
@@ -945,7 +1024,22 @@ OP_DUP OP_HASH160 <20-byte-pubkeyhash> OP_EQUALVERIFY OP_CHECKSIG  // P2PKH
 ### PHP Implementation
 
 ```php
+/**
+ * Build the nftCommitScript for a Glyph NFT commit output.
+ *
+ * INVARIANTS (caller's responsibility — this function does NOT validate):
+ *   - $pubkeyhash MUST be exactly 40 hex chars (20-byte P2PKH pubkeyhash)
+ *   - $payloadHash MUST be exactly 64 hex chars (32-byte SHA256(CBOR payload))
+ *
+ * Passing shorter or attacker-influenced hex here produces a malformed
+ * script whose length bytes disagree with the actual content — in the
+ * worst case it can shift the pubkeyhash portion and direct the NFT to
+ * an attacker-chosen address. Validate upstream before calling.
+ */
 private function buildNftCommitScript($pubkeyhash, $payloadHash) {
+    assert(strlen($pubkeyhash) === 40 && ctype_xdigit($pubkeyhash));
+    assert(strlen($payloadHash) === 64 && ctype_xdigit($payloadHash));
+
     $OP_HASH256 = 'aa';
     $OP_EQUALVERIFY = '88';
     $OP_DUP = '76';
@@ -1202,6 +1296,20 @@ function calculateFee($rpc, $txSize) {
 }
 ```
 
+> ⚠️  **Don't hardcode `feeRate` in client JS.** The most common way to break
+> users on a consensus-parameter change is to ship a JS bundle with a static
+> fee rate (e.g. `feeRate = 1000`), let the CDN cache it for days, and never
+> update when the network minimum moves. The CDN-cache trap in the
+> troubleshooting section below compounds this: an `immutable` response can
+> keep stale fees in browsers for a week after you think you've deployed the
+> fix, producing "min relay fee not met" errors that *only* the users see.
+>
+> Compute `feeRate` server-side on every mint (as `calculateFee` above does),
+> either by returning the current rate from your backend endpoint before the
+> client builds a tx, or by letting the server build and sign the tx end-to-end
+> (the pattern used in the Signing Challenge section). Either way, the network
+> minimum should never live as a literal in long-lived cached JS.
+
 ### Common Fee Bug
 
 ```php
@@ -1405,14 +1513,25 @@ in `radiant.conf` restricts the daemon to in-container loopback.
 bind host ports to `127.0.0.1:`, and attach both containers to the same Docker
 network. See Infrastructure Setup → Networking the Node.
 
-#### `ERROR: must be owner of table` during a DB migration
+#### Schema drift: three variants of "missing column"
 
-**Cause:** Running `ALTER TABLE` as the app user; Postgres requires table owner
-(typically the `postgres` superuser) for schema changes.
+The database part of minting has three distinct failure modes that look
+superficially similar but need different diagnostics. If you hit any of
+them, check **all three** locations where a new column lives: the schema
+definition, the API whitelist that filters incoming writes, and the
+actual INSERT/UPDATE column list.
 
-**Fix:** Run migrations with `-U postgres`, not `-U <app_user>`. Always migrate
-the database *before* deploying code that uses new columns, or every write
-hits a 500.
+| Symptom | Cause |
+|---|---|
+| `ERROR: must be owner of table` on `ALTER TABLE` | Running migration as the app user instead of `postgres` superuser. Use `-U postgres`. |
+| Every write returns 500 with `column "X" does not exist` | New code deployed before migration ran. Always migrate the DB *first*. |
+| Write "succeeds" in the UI but state resets on reload | Column exists in schema but API whitelist strips it, or upsert omits it. Save path silently drops the field; reload repopulates from DB with the missing value. |
+| Write succeeds but silently no-ops on one field | ORM silently dropping unknown columns. Check your DB client's strict/loose mode and the UPDATE column list. |
+
+The "looks saved in JS but resets on reload" version is the sneakiest — the
+failing field looks like a frontend bug because the UI appears to accept the
+change. It's almost always a desync between schema / API / upsert: the three
+places a new column has to be threaded through.
 
 #### Stale JS served to users after deploy
 
@@ -1448,7 +1567,7 @@ the problem is almost always the intermediate CDN layer.
 
 ### Protocol Errors
 
-### "NFT shows as blank card in wallet"
+#### "NFT shows as blank card in wallet"
 
 **Cause:** Missing `main` field with on-chain image data.
 
@@ -1460,7 +1579,7 @@ payload.main = {
 };
 ```
 
-### "NFT shows as 'Unknown NFT' with no metadata"
+#### "NFT shows as 'Unknown NFT' with no metadata"
 
 **Cause:** NFT was encoded with JSON instead of CBOR.
 
@@ -1475,7 +1594,7 @@ payload.main = {
 3. Verify: `console.log(typeof CBOR)` should output "object"
 4. Mint new NFT (old one cannot be fixed)
 
-### "Extra items left on stack after execution"
+#### "Extra items left on stack after execution"
 
 **Cause:** Using P2PKH commit instead of nftCommitScript.
 
@@ -1486,13 +1605,13 @@ const glyphHex = Array.from(glyphData).map(b => b.toString(16).padStart(2, '0'))
 const commitResult = await createCommitTransaction(feeRate, glyphHex);
 ```
 
-### "Unable to sign input, invalid stack size"
+#### "Unable to sign input, invalid stack size"
 
 **Cause:** Wallet RPC cannot sign custom nftCommitScript.
 
 **Fix:** Use external signing with Node.js and radiantjs (see Signing Challenge section).
 
-### "min relay fee not met (code 66)"
+#### "min relay fee not met (code 66)"
 
 **Cause:** Transaction fee is below Radiant's enforced minimum relay fee.
 
@@ -1514,7 +1633,7 @@ $minRate = ($h < 415000) ? 1000 : 10000; // legacy floor before grace ends
 
 Mainnet has been past 415,000 since early 2026; production code should default to 10,000.
 
-### "reference-operations" error
+#### "reference-operations" error
 
 **Cause:** Incorrect ref format or extra push opcode.
 
@@ -1522,19 +1641,19 @@ Mainnet has been past 415,000 since early 2026; production code should default t
 - Verify ref = reversed(txid) + LE(vout), exactly 36 bytes
 - Use `d8<ref>75...` NOT `d824<ref>75...`
 
-### "Signature must be zero"
+#### "Signature must be zero"
 
 **Cause:** Signing with P2PKH subscript instead of full commit script.
 
 **Fix:** In signing script, use `output.script` (full nftCommitScript).
 
-### "SSL certificate problem" (IPFS upload)
+#### "SSL certificate problem" (IPFS upload)
 
 See the full discussion in "IPFS Integration → SSL Certificate Issues" above —
 including the warning about why you must not ship with `IPFS_SKIP_SSL_VERIFY=true`
 enabled.
 
-### "Child NFTs don't appear in container" (Glyphium/Explorers)
+#### "Child NFTs don't appear in container" (Glyphium/Explorers)
 
 **Cause:** Using txid-derived ref instead of extracting from output script.
 
@@ -1814,7 +1933,17 @@ function isValidVout(vout) {
 ```
 
 ```php
-// Validate commitVout is reasonable
+// Validate commitVout is a non-negative integer in a sane range.
+// NOTE: use is_int + explicit cast, NOT just "< 0 || > 1000" — PHP's
+// type coercion means the string "abc" compares false to both bounds
+// and slips through. Do the type check first.
+if (!is_int($commitVout)) {
+    // Most $_POST/$_GET/JSON values arrive as strings; cast deliberately.
+    if (!is_numeric($commitVout) || (int)$commitVout != $commitVout) {
+        throw new Exception('Invalid commit output index (not an integer)');
+    }
+    $commitVout = (int)$commitVout;
+}
 if ($commitVout < 0 || $commitVout > 1000) {
     throw new Exception('Invalid commit output index');
 }
@@ -1853,7 +1982,12 @@ function createRevealTransaction($commitTxid, $commitVout, $glyphHex, $destAddre
         throw new Exception('Invalid commit transaction ID format');
     }
 
-    // 2. Validate commit vout is reasonable
+    // 2. Validate commit vout is a non-negative integer.
+    //    Cast first — PHP type coercion lets strings like "abc" pass bounds checks.
+    if (!is_numeric($commitVout) || (int)$commitVout != $commitVout) {
+        throw new Exception('Invalid commit output index (not an integer)');
+    }
+    $commitVout = (int)$commitVout;
     if ($commitVout < 0 || $commitVout > 1000) {
         throw new Exception('Invalid commit output index');
     }
@@ -1931,13 +2065,6 @@ that kept the effective floor at the legacy rate. From block 415,000 onward, the
 it or receive `{"code":-26,"message":"min relay fee not met (code 66)"}`.
 
 See Fee Calculations & Cost Analysis for the post-V2 cost tables.
-
-### New Protocols: dMint and WAVE
-
-- **dMint** — Mineable token distribution via PoW. Protocol combination `[1, 4]`. Three active mining algorithms: SHA256D (0), BLAKE3 (1), K12 (2).
-- **WAVE** — On-chain naming system. Protocol 11. Provides human-readable addresses and DNS-like records.
-
-See the [Radiant AI Knowledge Base](https://github.com/Radiant-Core/radiant-mcp-server/blob/master/docs/RADIANT_AI_KNOWLEDGE_BASE.md) for implementation details.
 
 ### New Protocols: dMint and WAVE
 
