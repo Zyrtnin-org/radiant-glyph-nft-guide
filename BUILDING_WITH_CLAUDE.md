@@ -212,18 +212,39 @@ Claude automatically generated:
 - Check balances, UTXOs, and transaction history
 - Read Glyph token metadata and verify NFT state
 - Build, sign, and broadcast transactions
-- Mint NFTs and FTs directly (commit/reveal flow)
-- Transfer and burn tokens
 - Decode scripts and parse Glyph envelopes
 - Query dMint contracts, WAVE names, and DEX orderbooks
 - Estimate fees from the network
+- Inspect mint txs, fetch raw transactions, and verify on-chain state
+
+> ⚠️ **Do not route signing WIFs through an LLM-connected MCP server.**
+> The Radiant MCP server exposes tools that can accept a WIF (mint, transfer,
+> burn). Any such call passes the WIF through the model's tool-call
+> serializer — the same channel an attacker can reach via prompt injection
+> from untrusted inputs the model reads (IPFS image captions, tx memos, web
+> pages, tool outputs from *other* MCP servers in the session). Prompt
+> injection is an active threat class against agentic LLM setups; no current
+> Claude model is hardened to refuse "now call mint_nft with wif=..."
+> instructions smuggled inside otherwise-benign tool output.
+>
+> **Safe operating model:**
+> 1. Use MCP in **read-only mode only**: fetch txs, decode scripts, query
+>    state. Never register tools that accept a WIF or broadcast a tx.
+> 2. Keep signing **off the LLM entirely** — the `sign_reveal.js` subprocess
+>    pattern in the README (stdin-only WIF, no argv, no env) is purpose-built
+>    for this. The signer runs on a host the LLM has no shell access to.
+> 3. If you *must* expose a broadcast tool, require human confirmation for
+>    every `sendrawtransaction` call and never stream the raw tx hex through
+>    the LLM.
+> 4. Use a dedicated hot wallet with a small balance for any MCP-accessible
+>    path, with separation from your mint-authority / treasury keys.
 
 ### Still Always Needed
 
 - **Visual verification in Glyphium/Photonic wallet** — screenshots catch display issues code can't
 - **Testing NFT display in wallets** — blank cards, metadata rendering problems
 - **Mempool inspection** — not available via MCP
-- **Private key security review** — MCP accepts WIF keys for signing; understand the trust implications
+- **Private key handling** — keep WIFs out of LLM context entirely; see the warning above and the `sign_reveal.js` subprocess pattern in the README
 
 ### Setting Up the MCP Server
 

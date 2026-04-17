@@ -241,6 +241,24 @@ WRONG:   d824<ref>7576a914...  // The 24 breaks it
      radiant-core:2.3.0
    ```
 
+   **Verify the tarball SHA256 before you RUN it.** Your Dockerfile should
+   contain an explicit checksum step so a swapped release asset fails the
+   build rather than silently producing a malicious node. Copy the published
+   SHA from the GitHub release page, then:
+
+   ```dockerfile
+   ARG RADIANT_VERSION=2.3.0
+   ARG RADIANT_SHA256=<paste-from-release-page>
+   RUN curl -fsSLO "https://github.com/RadiantBlockchain/radiant-node/releases/download/v${RADIANT_VERSION}/radiant-core-${RADIANT_VERSION}-linux-x64.tar.gz" && \
+       echo "${RADIANT_SHA256}  radiant-core-${RADIANT_VERSION}-linux-x64.tar.gz" | sha256sum -c - && \
+       tar xzf "radiant-core-${RADIANT_VERSION}-linux-x64.tar.gz"
+   ```
+
+   If upstream releases change archive layout between minor versions
+   (v2.2.0 nested under `radiant-core-linux-x64/`, v2.3.0 at archive root),
+   inspect with `tar tzf` before updating your `cp` paths — but never skip
+   the checksum step.
+
    **Bind RPC to `127.0.0.1:` on the host.** The P2P port 7333 is the only port
    that should face the public internet. See "Networking the Node" below for the
    matching `radiant.conf` settings when the node and your PHP backend run in
@@ -335,6 +353,44 @@ WRONG:   d824<ref>7576a914...  // The 24 breaks it
 - JavaScript or PHP programming
 - Understanding of public/private key cryptography
 
+### Funding Your First Wallet — Start on Regtest
+
+**Do not mint with real RXD until you have completed at least one full
+commit → reveal → wallet-recognition cycle on regtest.** The two-transaction
+commit/reveal pattern has three independent failure modes (commit-script
+mismatch, fee miscalculation, reveal-tx malleation) that all look the same
+from the outside: your NFT is gone and your coins are gone. Regtest gives you
+unlimited free retries.
+
+**Regtest bring-up:**
+
+```bash
+# Start a node in regtest mode
+radiantd -regtest -daemon
+
+# Generate an address and fund it (101 blocks so first coinbase matures)
+ADDR=$(radiant-cli -regtest getnewaddress)
+radiant-cli -regtest generatetoaddress 101 "$ADDR"
+
+# Verify balance
+radiant-cli -regtest getbalance
+# Expected: 50.00000000 (first coinbase, matured)
+```
+
+Point your minter's RPC config at the regtest node (default port `18332`,
+separate datadir from mainnet). Run your full mint flow end to end and
+confirm:
+
+1. The reveal transaction confirms in a block you generate.
+2. `listunspent` on the destination wallet shows the Glyph UTXO.
+3. A view-only classifier (e.g. `radiant-ledger-app/view-only-ui/`)
+   recognises the scriptPubKey shape.
+
+Only after all three check out should you touch mainnet. Mainnet funding —
+acquiring real RXD — is outside this guide; see the Radiant community
+resources at https://radiantblockchain.org and the `#mining` / `#general`
+channels on the Radiant Discord.
+
 ---
 
 ## Infrastructure Setup
@@ -376,6 +432,30 @@ Persisting the volume is necessary but **not sufficient** across version jumps:
   returning `ismine: false` for an address you know you funded.
 
 **Always copy `wallet.dat` out before upgrading or rebuilding the image.**
+
+**Multi-wallet and named-wallet RPC.** If you run more than one wallet on
+the node (e.g. a hot mint wallet plus a separate change wallet), you must
+address them explicitly — the default wallet is only `""` when there is
+exactly one loaded. Relevant commands:
+
+```bash
+# Create a named wallet (one time)
+radiant-cli createwallet "mint-hot"
+
+# Load it on restart if it isn't auto-loaded (check listwallets)
+radiant-cli loadwallet "mint-hot"
+
+# Target a specific wallet for an RPC call
+radiant-cli -rpcwallet=mint-hot getbalance
+radiant-cli -rpcwallet=mint-hot listunspent
+```
+
+PHP code that builds transactions should either (a) always pass
+`-rpcwallet=<name>` by using the per-wallet HTTP endpoint
+`http://node:7332/wallet/mint-hot` in its RPC URL, or (b) ensure only one
+wallet is loaded at a time. Mixing unqualified calls with multiple loaded
+wallets produces "Wallet file not specified" errors that look transient but
+are deterministic.
 
 ```bash
 # Before the upgrade
@@ -487,14 +567,25 @@ gets *hidden* by the mount the moment the container starts. Install at an
 image-local path and expose via `NODE_PATH`:
 
 ```dockerfile
+# Pin a specific commit SHA. Treat chainbow/radiantjs as an untrusted
+# dependency (see Supply-Chain section below) — a moving ref lets a
+# compromised upstream swap in a malicious build on your next rebuild.
+# Replace <pinned-sha> with a reviewed commit from the repo.
 RUN mkdir -p /opt/signing-deps && cd /opt/signing-deps && \
-    echo '{"name":"signing","version":"1.0.0","dependencies":{"radiantjs":"github:chainbow/radiantjs"}}' > package.json && \
-    npm install --omit=dev && \
+    echo '{"name":"signing","version":"1.0.0","dependencies":{"radiantjs":"github:chainbow/radiantjs#<pinned-sha>"}}' > package.json && \
+    echo '{}' > package-lock.json && \
+    npm ci --omit=dev 2>/dev/null || npm install --omit=dev --no-package-lock && \
     mkdir -p node_modules/@radiantblockchain && \
     ln -sfn ../radiantjs node_modules/@radiantblockchain/radiantjs
 
 ENV NODE_PATH=/opt/signing-deps/node_modules
 ```
+
+**Never use an unpinned `github:chainbow/radiantjs` dependency in a production
+image.** GitHub tarball installs resolve the default branch at image-build
+time — a compromised upstream or a branch rename could silently substitute
+code that signs transactions with attacker-controlled values. Use a SHA you
+have reviewed, and update the pin through a deliberate PR, not a rebuild.
 
 The symlink exists because npm installs the package using its declared name
 (`radiantjs` top-level, despite the package's own `package.json` declaring
@@ -537,12 +628,25 @@ function signRevealViaNode(array $params, string $scriptPath): array {
     stream_set_blocking($pipes[2], false);
 
     $start = time();
-    while (time() - $start < 60) {
+    $timedOut = false;
+    while (true) {
         $status = proc_get_status($proc);
         $stdout .= (string) stream_get_contents($pipes[1]);
         $stderr .= (string) stream_get_contents($pipes[2]);
         if (!$status['running']) {
             $capturedExitCode = $status['exitcode']; // capture BEFORE proc_close
+            break;
+        }
+        if (time() - $start >= 60) {
+            // Timeout — stop the Node child so it doesn't become a zombie
+            // and hold the wallet WIF in memory longer than necessary.
+            // SIGTERM first, then SIGKILL after 2s grace.
+            proc_terminate($proc, 15);
+            usleep(2_000_000);
+            if (proc_get_status($proc)['running']) {
+                proc_terminate($proc, 9);
+            }
+            $timedOut = true;
             break;
         }
         usleep(50_000);
@@ -553,6 +657,9 @@ function signRevealViaNode(array $params, string $scriptPath): array {
     fclose($pipes[2]);
 
     $closeCode = proc_close($proc);
+    if ($timedOut) {
+        throw new RuntimeException("sign timed out after 60s: $stderr");
+    }
     $exit = ($closeCode === -1 && $capturedExitCode !== null)
         ? $capturedExitCode
         : $closeCode;
@@ -579,27 +686,70 @@ valid tx that *pays an attacker address*. The blockchain won't reject a valid
 tx just because it wasn't the one you expected — it only rejects malformed
 ones.
 
-Before `sendrawtransaction`, decode the returned raw tx and assert the outputs
-match what you asked for:
+Before `sendrawtransaction`, decode the returned raw tx and assert the
+**entire** output set matches what you asked for. Checking only `vout[0]`
+is insufficient — a compromised signer can keep output 0 correct and smuggle
+an attacker-funding output 2, quietly skimming RXD per mint.
 
 ```php
 // After $parsed['signedTx'] comes back:
 $decoded = $rpc->call('decoderawtransaction', [$parsed['signedTx']]);
 
-// Output 0 must be the singleton script with the expected destination pubkeyhash
+// 1. Output count must match what you built. Typical NFT mint: 2 outputs
+//    (singleton at vout[0] + change at vout[1]). No extra outputs allowed.
+if (count($decoded['vout']) !== $expectedOutputCount) {
+    throw new RuntimeException('unexpected output count — refusing to broadcast');
+}
+
+// 2. Output 0 must be the singleton script with the expected destination.
+//    Compare in integer photons (NOT float RXD — IEEE-754 drift will reject
+//    legitimate txs at 8-decimal precision).
 $out0 = $decoded['vout'][0];
-if ($out0['value'] * 100_000_000 !== $expectedNftOutputSats) {
-    throw new RuntimeException('signed tx output value mismatch');
+$out0Sats = intval(round(floatval($out0['value']) * 100_000_000));
+if ($out0Sats !== $expectedNftOutputSats) {
+    throw new RuntimeException('signed tx NFT output value mismatch');
 }
 $expectedScript = 'd8' . $ref . '7576a914' . $expectedDestPubkeyhash . '88ac';
 if (strtolower($out0['scriptPubKey']['hex']) !== $expectedScript) {
-    throw new RuntimeException('signed tx output script mismatch — refusing to broadcast');
+    throw new RuntimeException('signed tx NFT output script mismatch');
 }
-// Optional: also check no unexpected outputs (only the singleton + any change)
+
+// 3. Every non-NFT output (change, if present) must be a plain P2PKH to a
+//    pubkeyhash from your own allow-list. Reject any novel destination —
+//    that's where a compromised signer would drain to.
+$allowedChangeHashes = array_map('strtolower', $yourAllowedChangePubkeyhashes);
+for ($i = 1; $i < count($decoded['vout']); $i++) {
+    $o = $decoded['vout'][$i];
+    $spk = strtolower($o['scriptPubKey']['hex']);
+    // Expect exactly 76a914<pkh20>88ac, 25 bytes = 50 hex chars
+    if (strlen($spk) !== 50 || substr($spk, 0, 6) !== '76a914' || substr($spk, -4) !== '88ac') {
+        throw new RuntimeException("vout[$i] is not a plain P2PKH");
+    }
+    $pkh = substr($spk, 6, 40);
+    if (!in_array($pkh, $allowedChangeHashes, true)) {
+        throw new RuntimeException("vout[$i] pays an unexpected address — refusing to broadcast");
+    }
+}
+
+// 4. Value conservation: Σ outputs + expected fee == Σ inputs (within 1%).
+//    Use decoderawtransaction on each prevout to get the input values.
+$inSats = array_sum(array_map(function($vin) use ($rpc) {
+    $prev = $rpc->call('getrawtransaction', [$vin['txid'], true]);
+    return intval(round(floatval($prev['vout'][$vin['vout']]['value']) * 100_000_000));
+}, $decoded['vin']));
+$outSats = array_sum(array_map(fn($o) => intval(round(floatval($o['value']) * 100_000_000)), $decoded['vout']));
+$actualFee = $inSats - $outSats;
+if (abs($actualFee - $expectedFeeSats) > max(1000, $expectedFeeSats * 0.01)) {
+    throw new RuntimeException("fee mismatch: signer used $actualFee, expected $expectedFeeSats");
+}
 ```
 
-Without this gate, "trust the stdout JSON" is a soft trust boundary that only
-the cryptographic correctness of the tx (not its semantics) defends.
+This full gate — output-count + NFT output + change allow-list + value
+conservation — is the defense against a compromised `chainbow/radiantjs` or
+signer. Do not skip any of the four checks. A compromised signer that splits
+outputs to smuggle a skim-drain is the primary documented attack surface
+here; partial validation catches the easy attacks but misses the
+output-splitting variant.
 
 **6. RPC creds never touch the browser.** Wrap every blockchain call behind a
 PHP endpoint that:
@@ -635,9 +785,22 @@ IPFS links in the `loc` field are for **full-resolution backup**, not wallet dis
         t: 'image/webp',           // MIME type (must match thumbnail format)
         b: thumbnailUint8Array     // Image data as Uint8Array
     },
-    loc: 'ipfs://Qm...'            // Full-res backup (optional)
+    loc: 'ipfs://Qm...',           // Full-res backup (optional)
+    loc_hash: 'sha256:abcd…'       // RECOMMENDED — sha256 of the loc asset's raw bytes
 }
 ```
+
+> **Bind off-chain content to the NFT with `loc_hash`.** IPFS (and any other
+> off-chain pointer) guarantees retrievability, not authenticity once the
+> pinning service is out of your control. Recording `sha256:<hex>` of the
+> full-resolution file's raw bytes inside the CBOR payload gives viewers a
+> way to detect substitution: compute `sha256(bytes)` of whatever the
+> gateway returns, compare, reject mismatches. Without this field,
+> "`ipfs://…` points at content of the same CID" is the only check anyone
+> downstream can make — and CIDs can be swapped at the application layer
+> (pinata config, wallet renderer, custom gateway) before the user sees
+> them. `loc_hash` costs ~40 bytes on chain; the integrity guarantee is
+> disproportionate.
 
 ### Thumbnail Size vs Cost Tradeoffs
 
@@ -851,9 +1014,12 @@ opcodes in the sequence are:
 - `e4` = `OP_CODESCRIPTHASHVALUESUM_OUTPUTS` — same, for outputs
 
 The remaining bytes in the epilogue (`de`, `c0`, `aa`, `76`, `78`, `a2`,
-`69`, `9d`) are standard Bitcoin Script opcodes (stack manipulation,
-comparison, hashing) that wire the two sums together into the conservation
-check. A full opcode-by-opcode decode is available in
+`69`, `9d`) are a mix of BCH-lineage opcodes retained by Radiant (stack
+manipulation, comparison, hashing — e.g. `76 = OP_DUP`, `a2 = OP_GREATERTHANOREQUAL`,
+`9d = OP_EQUALVERIFY`) and Radiant-specific introspection opcodes (`de`, `c0`,
+`aa`, `78`) that feed the state-aware values into the comparison. Calling
+them "standard Bitcoin" would be misleading — several are Radiant additions.
+Together they wire the two sums into the conservation check. A full opcode-by-opcode decode is available in
 [`radiant-ledger-app/docs/solutions/integration-issues/radiant-glyph-ft-template-and-view-only-renderer.md`](https://github.com/Zyrtnin-org/radiant-ledger-app) — for this guide, the important
 takeaway is that together they enforce **Σ input photons ≥ Σ output photons**
 per codeScript hash — tokens cannot be inflated by a normal spend. Only the
@@ -947,6 +1113,39 @@ to users as spendable outputs.
 
 Reference implementation: [`classifier.mjs`](https://github.com/Zyrtnin-org/radiant-ledger-app/blob/main/view-only-ui/classifier.mjs) (pure ES module, 83 lines, no dependencies).
 
+### Constructing an FT Holder Output (Sending)
+
+When building a transfer, **do not try to derive** the 36-byte ref from the
+holder's address or pubkeyhash — the ref identifies the *token*, not the
+*holder*, and it is only discoverable by reading an existing FT UTXO of
+that token from the chain.
+
+Procedure for building a send:
+
+1. Identify the sender's existing FT UTXOs for the token (scantxoutset with
+   `raw(...)` descriptors, or index the chain). Pull the 75-byte
+   scriptPubKey hex.
+2. Extract the 36-byte ref: bytes `[27..63]` of the script (offset 54..126
+   in hex) — the `ref` field returned by the classifier.
+3. Build the destination holder output with the **same ref** and the
+   recipient's pubkeyhash:
+
+   ```
+   76 a914 <dest_pkh:20> 88ac bd d0 <ref:36> dec0e9aa76e378e4a269e69d
+   ```
+
+   The recipient's scriptPubKey must match this exact 75-byte template,
+   swapping only the 20-byte pubkeyhash. Any other structural change
+   (reordered bytes, missing `bd`, truncated epilogue) will fail the
+   conservation check at consensus.
+
+4. Conserve value: Σ input photons for this ref ≥ Σ output photons for this
+   ref. Surplus becomes the sender's own FT change output (same template,
+   sender's pkh, residual value).
+
+The `buildFtSpk(pkhHex, refHex)` helper in `classifier.mjs` produces the
+output script given a validated `(pkh, ref)` pair.
+
 ---
 
 ## CBOR Payload Format
@@ -969,9 +1168,25 @@ Reference implementation: [`classifier.mjs`](https://github.com/Zyrtnin-org/radi
         game: "Game Name",
         player: "Player Name"
     },
-    loc: "ipfs://..."                 // IPFS full-res location (optional)
+    loc: "ipfs://...",                // IPFS full-res location (optional)
+    loc_hash: "sha256:..."            // Content binding for `loc` (recommended)
 }
 ```
+
+> **Keep `attrs` to string-keyed primitives.** Viewers and indexers cannot
+> safely render arbitrary CBOR graphs: map keys that aren't strings, nested
+> tagged items, or cyclic references produce renderer divergence (one
+> wallet shows the NFT, another shows `Unknown`, a third throws). Recommend
+> the minimum discipline:
+>
+> - Keys: UTF-8 strings only, ≤ 32 characters.
+> - Values: string / integer / boolean / small byte-string (≤ 256 B).
+> - No nested maps or arrays of maps — flatten before encoding.
+> - No CBOR tags other than those the core protocol requires.
+>
+> `attrs` is a convenience surface, not a schema — treat it the way you'd
+> treat query-string parameters, not a general-purpose object store. The
+> `main` and `loc` fields are where large/structured content goes.
 
 ### Protocol Identifiers
 
@@ -1059,14 +1274,19 @@ Using the wrong ref means:
 #### Implementation
 
 ```javascript
-// Helper to extract singleton ref from a transaction
+// Helper to extract singleton ref from a transaction.
+// Validates against the full 63-byte NFT singleton template — a bare
+// startsWith('d8') accepts any script leading with OP_PUSHINPUTREFSINGLETON,
+// including malformed or FT control scripts. The anchored regex below is
+// the same shape the wallet classifier enforces.
+const NFT_SPK_RE = /^d8[0-9a-f]{72}7576a914[0-9a-f]{40}88ac$/;
+
 async function getSingletonRef(txid, vout = 0) {
     const tx = await rpc.call('getrawtransaction', [txid, true]);
-    const script = tx.vout[vout].scriptPubKey.hex;
+    const script = (tx.vout[vout].scriptPubKey.hex || '').toLowerCase();
 
-    // Verify it's a singleton script (starts with d8)
-    if (!script.startsWith('d8')) {
-        throw new Error('Not a singleton output');
+    if (!NFT_SPK_RE.test(script)) {
+        throw new Error('Not an NFT singleton output');
     }
 
     // Extract 36-byte ref (72 hex chars starting at position 2)
@@ -1244,13 +1464,170 @@ private function buildNftCommitScript($pubkeyhash, $payloadHash) {
 ### Payload Hash Calculation
 
 ```php
-// $glyphHex = "676c79" + <CBOR hex>
-$cborHex = substr($glyphHex, 6);  // Skip first 6 hex chars ("gly")
-$cborBinary = hex2bin($cborHex);
-$hash1 = hash('sha256', $cborBinary, true);   // First SHA256 (binary)
-$hash2 = hash('sha256', $hash1, false);        // Second SHA256 (hex)
-$payloadHash = $hash2;  // This goes in the nftCommitScript
+// Single-pass, single-name. $payloadHash is HEX (64 chars), not raw bytes —
+// buildNftCommitScript() expects hex and concatenates as a string.
+$cborHex = substr($glyphHex, 6);                                     // skip "gly" marker
+$payloadHash = hash('sha256', hash('sha256', hex2bin($cborHex), true), false);
 ```
+
+### Building the Commit Transaction End-to-End
+
+`buildNftCommitScript()` returns the OUTPUT script (one piece). A full commit
+transaction pulls a funded UTXO, sets `output[0] = nftCommitScript` at the
+commit amount, sends change back to your hot wallet, signs with
+`signrawtransactionwithwallet`, and broadcasts. This is the piece that the
+"Complete Implementation Example" further down assumes you have; here is the
+implementation:
+
+```php
+/**
+ * Build, sign, and broadcast the commit transaction.
+ *
+ * Returns: [
+ *   'txid'         => string,   // commit tx id (hex)
+ *   'vout'         => int,      // always 0 — the nftCommitScript output
+ *   'commitScript' => string,   // the exact output script (hex), save for reveal
+ *   'commitAmount' => int,      // the commit output value in photons
+ *   'payloadHash'  => string,   // the 32-byte SHA256d (hex) embedded in script
+ * ]
+ *
+ * $commitAmountSats must cover: reveal-tx fee + reveal NFT output value + dust.
+ * For a ~1 KB reveal at 10,000 photons/byte: ~10.4M photons commit amount.
+ */
+function createCommitTransaction($rpc, $fundingAddress, $glyphHex, $commitAmountSats, $feeRateSatsPerByte) {
+    // 1. Build the commit output script from payloadHash + dest pubkeyhash.
+    $cborHex = substr($glyphHex, 6);
+    $payloadHash = hash('sha256', hash('sha256', hex2bin($cborHex), true), false);
+    $fundingInfo = $rpc->call('getaddressinfo', [$fundingAddress]);
+    $pubkeyhash  = $fundingInfo['scriptPubKey'] ? substr($fundingInfo['scriptPubKey'], 6, 40) : null;
+    if (strlen($pubkeyhash) !== 40) {
+        throw new RuntimeException('could not derive pubkeyhash for funding address');
+    }
+    $commitScript = buildNftCommitScript($pubkeyhash, $payloadHash);
+
+    // 2. Select UTXOs from the funding address. Pull smallest-first to avoid
+    //    fragmenting large ones (simple policy — swap for your own if needed).
+    $utxos = $rpc->call('listunspent', [1, 9999999, [$fundingAddress]]);
+    usort($utxos, fn($a, $b) => $a['amount'] <=> $b['amount']);
+
+    // 3. Rough tx-size estimate, in bytes: 10 header + (148 per P2PKH input) +
+    //    (8 + 1 + len(commitScript)/2) commit output + 34 change output.
+    $commitScriptBytes = strlen($commitScript) / 2;
+    $estimateSize = fn($numInputs) => 10 + ($numInputs * 148) + (8 + 1 + $commitScriptBytes) + 34;
+
+    $selected = [];
+    $totalIn = 0;
+    foreach ($utxos as $u) {
+        $selected[] = $u;
+        $totalIn += intval(round(floatval($u['amount']) * 100_000_000));
+        $feeSats  = $estimateSize(count($selected)) * $feeRateSatsPerByte;
+        if ($totalIn >= $commitAmountSats + $feeSats + 546) break;  // +dust for change
+    }
+    if ($totalIn < $commitAmountSats + $feeSats) {
+        throw new RuntimeException('insufficient funds for commit tx');
+    }
+
+    // 4. Build raw tx. Output 0 = nftCommitScript, output 1 = change (P2PKH).
+    $inputs = array_map(fn($u) => ['txid' => $u['txid'], 'vout' => $u['vout']], $selected);
+    $changeSats = $totalIn - $commitAmountSats - $feeSats;
+    $outputs = [];
+    // createrawtransaction doesn't accept raw-script outputs directly in
+    // Bitcoin-family RPC; use its "data" field for OP_RETURN only. For a
+    // custom script output, build the serialized tx by hand OR use
+    // `createrawtransaction` with a dummy output then splice the script.
+    // The hand-build is simpler — see Section 11 "Reveal Transaction" for
+    // the same pattern applied to the reveal. Here is the commit version:
+    $rawTx = buildRawTxWithCustomOutput($inputs, [
+        ['value' => $commitAmountSats, 'scriptHex' => $commitScript],
+        ['value' => $changeSats,       'scriptHex' => buildP2pkhScript($pubkeyhash)],
+    ]);
+
+    // 5. Sign with the wallet (standard P2PKH inputs — no custom signer needed).
+    $signed = $rpc->call('signrawtransactionwithwallet', [$rawTx]);
+    if (empty($signed['complete'])) {
+        throw new RuntimeException('commit signing incomplete: ' . json_encode($signed));
+    }
+
+    // 6. Broadcast.
+    $txid = $rpc->call('sendrawtransaction', [$signed['hex']]);
+
+    // 7. Wait for confirmation before building reveal — without this, the
+    //    reveal will fail with "bad-txns-inputs-missingorspent" if the node
+    //    hasn't indexed the commit output yet. Poll every few seconds.
+    waitForConfirmation($rpc, $txid, $minConfs = 1, $timeoutSec = 600);
+
+    return [
+        'txid'         => $txid,
+        'vout'         => 0,
+        'commitScript' => $commitScript,
+        'commitAmount' => $commitAmountSats,
+        'payloadHash'  => $payloadHash,
+    ];
+}
+
+function waitForConfirmation($rpc, $txid, $minConfs, $timeoutSec) {
+    $deadline = time() + $timeoutSec;
+    while (time() < $deadline) {
+        $tx = $rpc->call('getrawtransaction', [$txid, true]);
+        if (($tx['confirmations'] ?? 0) >= $minConfs) return;
+        sleep(5);
+    }
+    throw new RuntimeException("commit tx $txid did not reach $minConfs confirmations in {$timeoutSec}s");
+}
+```
+
+The `buildRawTxWithCustomOutput` helper is a straightforward serializer
+(version=2, varint inputs, `u64_le(value)` + varint(scriptLen) + scriptHex
+per output, locktime=0). The same pattern is applied to the reveal tx in
+`createCommitWithCustomScript()` shown in the Reveal Transaction section —
+lift from there.
+
+**Watch out for:**
+
+- **Wait for commit confirmation before reveal.** Some nodes will accept an
+  unconfirmed-input reveal; others reject with `bad-txns-inputs-missingorspent`
+  until the commit is in a block. Always confirm first.
+- **Commit output value must cover reveal fee + reveal output + dust.**
+  Undersize and the reveal fails with `min relay fee not met`; the commit
+  UTXO is then stuck behind the non-standard `nftCommitScript` and can only
+  be recovered by building a correctly-sized reveal (same `glyphHex`, same
+  commit outpoint — the payload hash is deterministic, so the same reveal
+  will still be valid).
+- **Change output goes back to the funding address.** Keeps your hot wallet
+  balance intact and predictable for the next mint.
+
+### Recovering From a Failed Reveal
+
+If the commit confirmed but the reveal broadcast failed (network hiccup,
+signing error, undersized fee, node rejected the scriptSig shape), **the
+commit UTXO is not lost** — it is still spendable, but only by a valid
+reveal transaction carrying the same payload hash. You cannot sweep it with
+an ordinary P2PKH spend; the `nftCommitScript` prologue requires the "gly"
+marker and CBOR body on the stack.
+
+Recovery procedure:
+
+1. **Do not rebuild from scratch.** The payload hash is deterministic over
+   `glyphHex`, so any new reveal you build from the original `glyphHex`
+   satisfies the commit script. Rebuilding with a different image or
+   different CBOR attrs changes the hash and the UTXO is unrecoverable.
+2. **Reuse the stored inputs.** Your minter should persist `commitTxid`,
+   `commitVout`, `commitAmountSats`, `glyphHex`, and `destPubkeyhash` before
+   broadcast — these are the five values a retry needs. Load them, rebuild
+   the reveal, re-sign, and rebroadcast.
+3. **Check mempool first.** Before assuming the reveal failed, run
+   `getrawtransaction <revealTxid> 0` and `getmempoolentry <revealTxid>`.
+   A RPC error may have dropped your client's return value while the node
+   still accepted the tx. Confirm with a block explorer before paying fees
+   on a duplicate.
+4. **If mempool eviction is the cause**, raise the fee rate in the new
+   reveal (same commit input, same glyph, higher fee → smaller change
+   output) and rebroadcast. Do not RBF — the commit script does not admit
+   a replacement path.
+
+The worst outcome is a commit UTXO that sits unspent indefinitely; the RXD
+inside is not burned, just locked behind a script that only a correctly-
+built reveal can satisfy.
 
 ---
 
@@ -1610,6 +1987,20 @@ function uploadFileToPinata($fileData, $filename, $mimeType = 'image/jpeg') {
     $result = json_decode($response, true);
     $gateway = getenv('PINATA_GATEWAY') ?: 'gateway.pinata.cloud';
 
+    // Defence in depth: validate PINATA_GATEWAY against a hostname allow-list
+    // so a polluted env cannot redirect renders through an attacker-controlled
+    // gateway. Rendering code that trusts gatewayUrl verbatim will fetch
+    // content from whatever host is set here.
+    $allowedGateways = [
+        'gateway.pinata.cloud',
+        'ipfs.io',
+        'dweb.link',
+        'cloudflare-ipfs.com',
+    ];
+    if (!in_array($gateway, $allowedGateways, true)) {
+        throw new RuntimeException("PINATA_GATEWAY '{$gateway}' not in allow-list");
+    }
+
     return [
         'success' => true,
         'cid' => $result['IpfsHash'],
@@ -1806,7 +2197,9 @@ payload.main = {
 - Browser console shows: "CBOR library not loaded, using JSON fallback"
 
 **Fix:**
-1. Download CBOR library: `curl -o js/cbor.min.js "https://raw.githubusercontent.com/paroga/cbor-js/master/cbor.js"`
+1. Download CBOR library (vendor a pinned version — see the supply-chain
+   warning in Infrastructure Setup; do not fetch from `master` at build time
+   on production systems). Example: `curl -o js/cbor.min.js "https://raw.githubusercontent.com/paroga/cbor-js/<commit-sha>/cbor.js"` then verify with `sha256sum`.
 2. Load BEFORE blockchain scripts in HTML
 3. Verify: `console.log(typeof CBOR)` should output "object"
 4. Mint new NFT (old one cannot be fixed)
@@ -2364,3 +2757,33 @@ See [Thumbnail Size vs Cost Tradeoffs](#thumbnail-size-vs-cost-tradeoffs) and [F
 
 **License:** MIT
 **Radiant Blockchain:** https://radiantblockchain.org
+
+---
+
+## Disclaimer & Warranty
+
+This guide is provided **as is**, without warranty of any kind, express or
+implied. The patterns, code, and templates documented here have been tested
+against mainnet at a specific point in time but consensus rules,
+dependencies, and infrastructure can change. Readers are responsible for:
+
+- Verifying all claims against the current Radiant Core source and their
+  own test results on regtest before deploying to mainnet.
+- Auditing any third-party dependency they install (`chainbow/radiantjs`,
+  `paroga/cbor-js`, Radiant Core release tarballs, Pinata SDKs, Ledger
+  app-radiant-v1 firmware). Nothing in this guide constitutes a
+  recommendation that these dependencies are trustworthy — it documents
+  *how* to use them with the least risk, not *whether* to use them.
+- Their own key management and funds. The authors accept no liability for
+  lost RXD, lost NFTs, lost FT supply, stuck commit UTXOs, or
+  attacker-controlled spends resulting from misapplied patterns.
+
+**Ledger app-radiant-v1 is community-maintained and unaudited.** The
+customisable-helpers patch described in this guide (and shipped in the
+`v0.0.8-glyph-transfer` release) was built to demonstrate that Glyph
+transfer-preserving spends *can* be signed by a Ledger device. It has not
+undergone a formal security audit. Use it on testnet first; if you use it
+on mainnet, start with values you can afford to lose.
+
+In short: treat this guide as a technical map, not a warranty. The terrain
+is yours to navigate.
